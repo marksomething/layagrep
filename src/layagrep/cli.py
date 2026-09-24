@@ -1,21 +1,37 @@
-"""Command-line semantic grep backed by Laya's ``noul`` question type."""
+"""Command-line interface for :mod:`layagrep.engine`.
+
+Only presentation lives here: argument parsing, reading inputs, formatting
+matches, and exit statuses. All matching logic is in :mod:`layagrep.engine`.
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
-import math
+import os
+import signal
 import sys
-import warnings
-from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any
 
-QUESTION_KEY = "match"
-LAYA_CALIBRATION_WARNING = (
-    r"^laya: this checkpoint ships invalid temperatures or values outside "
-    r".*using choice:11\+="
+from layagrep.engine import (
+    DEFAULT_THRESHOLD,
+    MODE_NOUL,
+    MODES,
+    SORT_LINE,
+    SORT_SCORE,
+    SORTS,
+    Match,
+    Matcher,
+    create_router,
+    iter_lines,
+    rank_matches,
 )
+
+EXIT_MATCH = 0
+EXIT_NO_MATCH = 1
+EXIT_ERROR = 2
+EXIT_BROKEN_PIPE = 128 + int(signal.SIGPIPE)  # 141, the status grep gets from SIGPIPE
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -45,160 +61,189 @@ def build_parser() -> argparse.ArgumentParser:
         "-t",
         "--threshold",
         type=float,
-        default=0.5,
+        default=DEFAULT_THRESHOLD,
         metavar="PROBABILITY",
-        help="minimum noul yes-probability to match (default: 0.5)",
+        help=f"minimum noul yes-probability to match (default: {DEFAULT_THRESHOLD})",
     )
-    parser.add_argument("-n", "--line-number", action="store_true", help="prefix output with line numbers")
+    parser.add_argument(
+        "-m",
+        "--mode",
+        choices=MODES,
+        default=MODE_NOUL,
+        help=(
+            "question type used for matching: 'noul' (calibrated yes/no probability) or "
+            "'choice' (two-option choice, immune to noul's false/true label bias)"
+        ),
+    )
+    parser.add_argument(
+        "-b",
+        "--batch-size",
+        type=int,
+        metavar="N",
+        help="score N lines per batched call (faster on large inputs; less lazy)",
+    )
+    parser.add_argument(
+        "-n", "--line-number", action="store_true", help="prefix output with line numbers"
+    )
     filenames = parser.add_mutually_exclusive_group()
-    filenames.add_argument("-H", "--with-filename", action="store_true", help="always print filenames")
-    filenames.add_argument("-h", "--no-filename", action="store_true", help="never print filenames")
-    parser.add_argument("-v", "--invert-match", action="store_true", help="select lines below the threshold")
-    parser.add_argument("-c", "--count", action="store_true", help="print the number of selected lines per input")
-    parser.add_argument("-l", "--files-with-matches", action="store_true", help="print each input with a match")
-    parser.add_argument("-q", "--quiet", action="store_true", help="stop after the first match; print nothing")
+    filenames.add_argument(
+        "-H", "--with-filename", action="store_true", help="always print filenames"
+    )
+    filenames.add_argument(
+        "-h", "--no-filename", action="store_true", help="never print filenames"
+    )
+    parser.add_argument(
+        "-v", "--invert-match", action="store_true", help="select lines below the threshold"
+    )
+    parser.add_argument(
+        "-c", "--count", action="store_true", help="print the number of selected lines per input"
+    )
+    parser.add_argument(
+        "-l", "--files-with-matches", action="store_true", help="print each input with a match"
+    )
+    parser.add_argument(
+        "-q", "--quiet", action="store_true", help="stop after the first match; print nothing"
+    )
+    parser.add_argument(
+        "--sort",
+        choices=SORTS,
+        default=SORT_LINE,
+        help="output order: 'line' (default) or 'score' (best matches first)",
+    )
+    parser.add_argument(
+        "--top",
+        type=int,
+        metavar="N",
+        help="print only the N best matches (implies --sort score; collects matches first)",
+    )
     output = parser.add_mutually_exclusive_group()
-    output.add_argument("--scores", action="store_true", help="include each match's noul probability")
-    output.add_argument("--json", action="store_true", help="write matching lines as JSON Lines, including noul scores")
+    output.add_argument(
+        "--scores", action="store_true", help="include each match's noul probability"
+    )
+    output.add_argument(
+        "--json",
+        action="store_true",
+        help="write matching lines as JSON Lines with score, confidence, and routing metadata",
+    )
     return parser
 
 
-def validate_probability(value: float, option: str) -> None:
-    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
-        raise ValueError(f"{option} must be a number between 0 and 1")
-
-
-def noul_probability(result: dict[str, Any]) -> float:
-    """Read and validate the yes-probability returned for the noul answer."""
-    try:
-        value = float(result["answers"][QUESTION_KEY]["noul"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError("Laya response did not contain answers.match.noul") from exc
-    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
-        raise ValueError(f"Laya returned an invalid noul probability: {value!r}")
-    return value
-
-
-def matches(probability: float, threshold: float, invert: bool = False) -> bool:
-    selected = probability >= threshold
-    return not selected if invert else selected
+def check_options(args: argparse.Namespace) -> str | None:
+    """Validate flag combinations; return an error message or ``None``."""
+    if not 0.0 <= args.threshold <= 1.0:
+        return "--threshold must be a number between 0 and 1"
+    if args.batch_size is not None and args.batch_size < 1:
+        return "--batch-size must be at least 1"
+    if args.top is not None and args.top < 1:
+        return "--top must be at least 1"
+    if args.top is not None or args.sort == SORT_SCORE:
+        for flag, enabled in (
+            ("-c/--count", args.count),
+            ("-l/--files-with-matches", args.files_with_matches),
+            ("-q/--quiet", args.quiet),
+        ):
+            if enabled:
+                return f"--sort score/--top cannot be combined with {flag}"
+    return None
 
 
 def format_match(
+    match: Match,
     *,
-    path: str,
-    line_number: int,
-    text: str,
-    probability: float,
     show_filename: bool,
-    args: argparse.Namespace,
+    show_line_number: bool,
+    show_scores: bool,
+    as_json: bool,
 ) -> str:
-    if args.json:
+    """Render one match for output."""
+    if as_json:
         return json.dumps(
-            {"file": path, "line": line_number, "score": probability, "text": text},
+            {
+                "file": match.source,
+                "line": match.line_number,
+                "text": match.text,
+                "score": match.score,
+                "confidence": match.confidence,
+                "routing": match.routing,
+            },
             ensure_ascii=False,
         )
 
     prefix = ""
     if show_filename:
-        prefix += f"{path}:"
-    if args.line_number:
-        prefix += f"{line_number}:"
-    if args.scores:
-        prefix = f"{probability:.3f}\t{prefix}"
-    return f"{prefix}{text}"
-
-
-def iter_lines(stream: TextIO) -> Iterable[tuple[int, str]]:
-    for number, raw_line in enumerate(stream, start=1):
-        # Remove only line terminators; preserve all other whitespace in the match.
-        yield number, raw_line.rstrip("\r\n")
+        prefix += f"{match.source}:"
+    if show_line_number:
+        prefix += f"{match.line_number}:"
+    if show_scores:
+        prefix = f"{match.score:.3f}\t{prefix}"
+    return f"{prefix}{match.text}"
 
 
 def search_stream(
-    stream: TextIO,
+    stream: Any,
     *,
     path: str,
-    description: str,
-    router: Any,
+    matcher: Matcher,
     args: argparse.Namespace,
     show_filename: bool,
-) -> tuple[int, float | None]:
-    """Search one stream, printing selected lines and returning count/first score."""
-    question = {
-        QUESTION_KEY: {
-            "type": "noul",
-            "instructions": (
-                f"{description}"
-            ),
-        }
-    }
-    count = 0
-    first_probability: float | None = None
-    for line_number, text in iter_lines(stream):
-        # Laya currently emits this known warning for its unused 11+-option choice
-        # calibration bucket. Keep it from cluttering grep output without muting other
-        # RuntimeWarnings from Laya or the application.
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                message=LAYA_CALIBRATION_WARNING,
-                category=RuntimeWarning,
-            )
-            result = router.predict(text, question)
-        probability = noul_probability(result)
-        if not matches(probability, args.threshold, args.invert_match):
-            continue
+) -> int:
+    """Search one stream, print selected lines as found, return how many matched."""
+    matches = matcher.search(
+        iter_lines(stream),
+        source=path,
+        threshold=args.threshold,
+        invert=args.invert_match,
+    )
 
+    count = 0
+    for match in matches:
         count += 1
-        if first_probability is None:
-            first_probability = probability
         if args.quiet:
-            return count, first_probability
+            return count
         if args.files_with_matches:
             print(path)
-            return count, first_probability
+            return count
         if not args.count:
             print(
                 format_match(
-                    path=path,
-                    line_number=line_number,
-                    text=text,
-                    probability=probability,
+                    match,
                     show_filename=show_filename,
-                    args=args,
+                    show_line_number=args.line_number,
+                    show_scores=args.scores,
+                    as_json=args.json,
                 )
             )
 
-    if args.files_with_matches and count:
-        print(path)
-    elif args.count:
+    if args.count:
         prefix = f"{path}:" if show_filename else ""
         print(f"{prefix}{count}")
-    return count, first_probability
+    return count
 
 
-def _load_router() -> Any:
-    try:
-        from laya import Router
-    except ImportError as exc:
-        raise RuntimeError("Could not import Laya. Install the project with `uv sync`.") from exc
-    return Router()
+def run(args: argparse.Namespace, predictor: Any | None = None) -> int:
+    problem = check_options(args)
+    if problem is not None:
+        print(f"layagrep: {problem}", file=sys.stderr)
+        return EXIT_ERROR
 
-
-def run(args: argparse.Namespace, router: Any | None = None) -> int:
-    validate_probability(args.threshold, "--threshold")
     paths = args.paths or ["-"]
     show_filename = args.with_filename or (len(paths) > 1 and not args.no_filename)
+    ranked = args.top is not None or args.sort == SORT_SCORE
 
     try:
-        router = router if router is not None else _load_router()
-    except (ImportError, RuntimeError) as exc:
+        matcher = Matcher(
+            args.description,
+            predictor if predictor is not None else create_router(),
+            mode=args.mode,
+            batch_size=args.batch_size,
+        )
+    except (ImportError, RuntimeError, ValueError) as exc:
         print(f"layagrep: {exc}", file=sys.stderr)
-        return 2
+        return EXIT_ERROR
 
     any_match = False
     had_error = False
+    ranked_matches: list[Match] = []
     for path in paths:
         if path == "-":
             stream = sys.stdin
@@ -213,14 +258,26 @@ def run(args: argparse.Namespace, router: Any | None = None) -> int:
                 continue
 
         try:
-            count, _ = search_stream(
-                stream,
-                path=path,
-                description=args.description,
-                router=router,
-                args=args,
-                show_filename=show_filename,
-            )
+            if ranked:
+                count = 0
+                for match in matcher.search(
+                    iter_lines(stream),
+                    source=path,
+                    threshold=args.threshold,
+                    invert=args.invert_match,
+                ):
+                    ranked_matches.append(match)
+                    count += 1
+            else:
+                count = search_stream(
+                    stream,
+                    path=path,
+                    matcher=matcher,
+                    args=args,
+                    show_filename=show_filename,
+                )
+        except BrokenPipeError:
+            raise  # `layagrep ... | head`: not an error, see main()
         except Exception as exc:
             print(f"layagrep: {path}: {exc}", file=sys.stderr)
             had_error = True
@@ -231,21 +288,58 @@ def run(args: argparse.Namespace, router: Any | None = None) -> int:
 
         any_match = any_match or count > 0
         if args.quiet and any_match:
-            return 0
+            return EXIT_MATCH
+
+    if ranked:
+        order = SORT_SCORE if (args.top is not None or args.sort == SORT_SCORE) else SORT_LINE
+        for match in rank_matches(ranked_matches, top=args.top, sort=order):
+            print(
+                format_match(
+                    match,
+                    show_filename=show_filename,
+                    show_line_number=args.line_number,
+                    show_scores=args.scores,
+                    as_json=args.json,
+                )
+            )
 
     if had_error:
-        return 2
-    return 0 if any_match else 1
+        return EXIT_ERROR
+    return EXIT_MATCH if any_match else EXIT_NO_MATCH
+
+
+def handle_broken_pipe() -> int:
+    """Silence the broken stdout and exit as grep does under SIGPIPE (141).
+
+    Redirecting stdout to devnull keeps the interpreter's shutdown flush from
+    printing "Exception ignored ... BrokenPipeError" after the pipe reader left.
+    """
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(devnull, sys.stdout.fileno())
+        finally:
+            os.close(devnull)
+    except (OSError, ValueError):
+        pass
+    return EXIT_BROKEN_PIPE
 
 
 def main() -> int:
+    # Die on SIGPIPE like grep does, so `layagrep ... | head` is silent. Python
+    # otherwise ignores SIGPIPE and turns it into BrokenPipeError at some write
+    # (or only at shutdown flush, which prints "Exception ignored" noise).
+    if hasattr(signal, "SIGPIPE"):
+        try:
+            signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+        except ValueError:  # not in the main thread
+            pass
     parser = build_parser()
     args = parser.parse_args()
     try:
         return run(args)
-    except ValueError as exc:
-        parser.error(str(exc))
-    return 2
+    except BrokenPipeError:
+        return handle_broken_pipe()
 
 
 if __name__ == "__main__":
